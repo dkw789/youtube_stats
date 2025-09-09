@@ -1,88 +1,194 @@
-## YouTube Most Popular (Recent)
+# YouTube Data Collection Scripts
 
-Find most-viewed YouTube videos published in the last week or month. Uses YouTube Data API v3.
+A collection of Python scripts for finding and analyzing YouTube content using the YouTube Data API v3 and RSS feeds.
 
-### Prerequisites
+## Scripts Overview
 
-- A YouTube Data API key. Create one in Google Cloud Console.
+### 1. `yt_most_popular.py` - General Popular Videos
+Find most-viewed YouTube videos published recently across all channels.
+
+### 2. `yt_subscription_podcasts.py` - Subscription Podcast Finder
+Find popular podcast episodes from your YouTube subscriptions.
+
+### 3. `yt_phased_runner.py` - Quota-Managed Collection
+Run data collection in phases to efficiently manage API quota limits.
+
+### 4. `youtube_auth.py` - Shared Authentication
+Manage OAuth authentication across all scripts with token caching.
+
+### 5. `youtube_subscriptions.py` - Advanced Subscription Manager
+Comprehensive subscription management with multiple data sources.
+
+## Prerequisites
+
 - Python 3.9+
+- YouTube Data API v3 access (API key or OAuth)
+- Optional: `feedparser` for RSS-only mode
 
-### Setup
+## Setup
 
 ```bash
+# Clone and setup environment
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# Either set the env var...
+# For RSS-only features
+pip install feedparser
+```
+
+### Authentication Setup
+
+**Option 1: API Key (Simple)**
+```bash
+# Set environment variable
 export YOUTUBE_API_KEY=YOUR_API_KEY_HERE
 
-# ...or create a .env file in the project root:
+# Or create .env file
 echo "YOUTUBE_API_KEY=YOUR_API_KEY_HERE" > .env
 ```
 
-### Usage
+**Option 2: OAuth (For Subscriptions)**
+1. Go to [Google Cloud Console](https://console.cloud.google.com)
+2. Create project and enable YouTube Data API v3
+3. Create OAuth 2.0 Client ID (Desktop application)
+4. Download `client_secret_*.json` file to project directory
+5. Add `http://localhost:8080` as authorized redirect URI
 
+## Usage Examples
+
+### General Popular Videos
 ```bash
-python yt_most_popular.py --period week --region US --top 25
+# Top 25 videos from last week
+python yt_most_popular.py --period week --top 25
+
+# Most liked videos, save to JSON
+python yt_most_popular.py --sort-by likes --json results.json
+
+# Podcast-specific search
+python yt_most_popular.py --podcast --period month --top 50
 ```
 
-Options:
-
-- `--period`: `week` (default) or `month`
-- `--region`: Region code like `US`, `GB`, `IN` (default: `US`)
-- `--max-results`: How many videos to fetch before ranking (default: 100)
-- `--top`: How many top results to display/output (default: 25)
-- `--sort-by`: Sort by `views` (default), `likes`, or `comments`
-- `--topic-id`: Optional Freebase topic ID to filter by topic
-- `--query`: Custom search query (default: broad search)
-- `--podcast`: Search specifically for podcast content
-- `--published-after`: Override ISO8601 timestamp, e.g. `2025-01-01T00:00:00Z`
-- `--api-key`: Provide API key via CLI instead of `YOUTUBE_API_KEY`
-- `--csv`: Path to write CSV
-- `--json`: Path to write JSON
-- `--md`: Path to write Markdown
-- `--no-cache`: Disable caching (force fresh API calls)
-- `--clear-cache`: Clear all cached data before running
-
-Examples:
-
+### Subscription Podcast Finder
 ```bash
-# Top 25 videos by views published in the past week in US
-python yt_most_popular.py --period week --region US --top 25
+# With authentication (full features)
+python yt_subscription_podcasts.py --period week --top 25 --json podcasts.json
 
-# Top 50 most liked videos in the past month
-python yt_most_popular.py --period month --sort-by likes --top 50
+# RSS-only mode (no quota, no auth)
+python yt_subscription_podcasts.py --rss-only --channel-ids "UCzQUP1qoWDoEbmsQxvdjxgQ" --json rss_podcasts.json
 
-# Top videos by comments in India, save to multiple formats
-python yt_most_popular.py --period month --region IN --sort-by comments --top 50 \
-  --csv top_comments.csv --json top_comments.json --md top_comments.md
-
-# Most popular podcasts this month
-python yt_most_popular.py --period month --podcast --top 25 --csv podcasts.csv
-
-# Most liked podcasts in the past week
-python yt_most_popular.py --period week --podcast --sort-by likes --top 20
-
-# Explicit publishedAfter window
-python yt_most_popular.py --published-after 2025-01-01T00:00:00Z --top 20
+# Quota-saving options
+python yt_subscription_podcasts.py --limit-channels 10 --videos-per-channel 3
 ```
 
-### Notes
+### Phased Collection (Quota Management)
+```bash
+# Check quota status
+python yt_phased_runner.py --status
 
-- The script first searches for videos ordered by view count within the window, then fetches statistics and re-sorts by `viewCount` to ensure accuracy.
-- **Quota protection**: The script tracks API usage and stops before exceeding the 10,000 daily free tier limit (with 500 unit safety buffer).
-- **Caching**: API responses are cached for 24 hours to save quota on repeated runs. Use `--no-cache` to force fresh data.
-- Environment variables are automatically loaded from a local `.env` file if present (via `python-dotenv`).
+# Run all phases with small batches
+python yt_phased_runner.py --channels-per-batch 3 --videos-per-batch 25
 
-### Troubleshooting
+# Run specific phase
+python yt_phased_runner.py --phase 2 --channels-per-batch 5
+```
 
-- 403 Forbidden from YouTube API:
-  - Ensure the YouTube Data API v3 is enabled for your project in Google Cloud.
-  - Verify the API key is correct and unrestricted or properly restricted (HTTP referrers or IPs).
-  - Check quota usage. Reduce `--max-results` or try later.
-  - If the error shows `reason=keyInvalid`, recreate a key; for `quotaExceeded`, wait or request more quota.
+### Authentication Management
+```bash
+# Test authentication
+python youtube_auth.py --test
 
-- macOS urllib3 OpenSSL warning (LibreSSL):
-  - This is a warning from urllib3 v2 on older LibreSSL. Consider using a newer Python (e.g., via `pyenv`) or ignore if requests still works.
+# Clear cached session
+python youtube_auth.py --clear
+```
 
+## Quota Management
+
+**YouTube API Quota Costs:**
+- Search: 100 units per request
+- Video details: 1 unit per video
+- Subscriptions: 1 unit per request
+- Daily limit: 10,000 units (free tier)
+
+**Quota-Saving Strategies:**
+1. **Use RSS mode**: Zero quota cost
+2. **Enable caching**: Reuse data for 24 hours
+3. **Limit batch sizes**: Process fewer items per run
+4. **Use phased approach**: Spread collection across days
+
+## Output Formats
+
+All scripts support multiple output formats:
+- **Console**: Formatted table display
+- **JSON**: `--json filename.json`
+- **CSV**: `--csv filename.csv`
+- **Markdown**: `--md filename.md`
+
+## Common Options
+
+- `--period week|month`: Time window for recent content
+- `--top N`: Number of results to return
+- `--sort-by views|likes|comments`: Sort criteria
+- `--no-cache`: Force fresh API calls
+- `--clear-cache`: Clear all cached data
+
+## RSS-Only Mode (No Quota)
+
+```bash
+# Find channel IDs from YouTube URLs
+# Example: https://youtube.com/c/channelname -> UCxxxxxxxxx
+
+# Use RSS feeds only (no authentication needed)
+python yt_subscription_podcasts.py --rss-only --no-auth \
+  --channel-ids "UCzQUP1qoWDoEbmsQxvdjxgQ,UCBJycsmduvYEL83R_U4JriQ" \
+  --period week --json rss_results.json
+```
+
+## Troubleshooting
+
+**403 Forbidden Errors:**
+- Enable YouTube Data API v3 in Google Cloud Console
+- Check API key restrictions
+- Verify OAuth scope includes `youtube.readonly`
+- Clear auth cache: `python youtube_auth.py --clear`
+
+**Quota Exceeded:**
+- Use `--rss-only` mode for zero quota usage
+- Reduce `--max-channels` and `--videos-per-channel`
+- Use phased collection: `python yt_phased_runner.py`
+- Wait for quota reset (daily at midnight Pacific Time)
+
+**OAuth Issues:**
+- Localhost redirect error is normal - copy code from URL
+- Ensure redirect URI `http://localhost:8080` is configured
+- Check OAuth consent screen is published
+
+**No Results Found:**
+- Try longer time periods: `--period month`
+- Use different channel IDs
+- Check if channels have recent uploads
+- Verify RSS feeds are available
+
+## File Structure
+
+```
+.
+├── yt_most_popular.py          # General popular videos
+├── yt_subscription_podcasts.py # Subscription podcast finder
+├── yt_phased_runner.py         # Quota-managed collection
+├── youtube_auth.py             # Shared authentication
+├── youtube_subscriptions.py    # Advanced subscription manager
+├── requirements.txt            # Python dependencies
+├── .env                        # Environment variables (optional)
+├── client_secret_*.json        # OAuth credentials (optional)
+└── .cache/                     # Cached API responses
+```
+
+## Advanced Features
+
+- **Smart caching**: 24-hour cache with automatic expiration
+- **Quota tracking**: Cross-session quota usage monitoring
+- **Progress saving**: Resume interrupted collections
+- **Batch processing**: Efficient API usage patterns
+- **Error recovery**: Graceful handling of API limits
+- **Multi-format output**: JSON, CSV, Markdown support

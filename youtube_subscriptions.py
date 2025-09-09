@@ -32,6 +32,73 @@ OUTPUT_DIR = "subscriptions_output"
 CACHE_DIR = os.path.join(OUTPUT_DIR, ".cache")
 
 
+def get_cache_key(data: str) -> str:
+    """Generate cache key from data string."""
+    return hashlib.md5(data.encode()).hexdigest()[:16]
+
+def load_cache(cache_path: str, max_age: str = "day") -> List[Dict]:
+    """Load cached data if valid."""
+    if not os.path.exists(cache_path):
+        return None
+    
+    try:
+        with open(cache_path, 'r') as f:
+            cache_data = json.load(f)
+        
+        cached_time = datetime.fromisoformat(cache_data["timestamp"])
+        now = datetime.now(timezone.utc)
+        
+        if max_age == "day":
+            max_delta = timedelta(hours=24)
+        elif max_age == "week":
+            max_delta = timedelta(days=7)
+        else:  # month
+            max_delta = timedelta(days=30)
+        
+        if now - cached_time < max_delta:
+            return cache_data["data"]
+    except (json.JSONDecodeError, KeyError, ValueError):
+        pass
+    
+    return None
+
+def save_cache(cache_path: str, data: List[Dict]):
+    """Save data to cache."""
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    
+    cache_data = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": data
+    }
+    
+    with open(cache_path, 'w') as f:
+        json.dump(cache_data, f)
+
+def get_cached_access_token() -> Optional[str]:
+    """Get cached access token if valid."""
+    token_cache = os.path.join(CACHE_DIR, "access_token.json")
+    if os.path.exists(token_cache):
+        try:
+            with open(token_cache, 'r') as f:
+                token_data = json.load(f)
+            
+            token_time = datetime.fromisoformat(token_data["timestamp"])
+            if datetime.now(timezone.utc) - token_time < timedelta(minutes=55):
+                return token_data["access_token"]
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+    return None
+
+def save_access_token(access_token: str):
+    """Save access token to cache."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    token_cache = os.path.join(CACHE_DIR, "access_token.json")
+    with open(token_cache, 'w') as f:
+        json.dump({
+            "access_token": access_token,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }, f)
+
 def get_oauth_credentials() -> Tuple[str, str]:
     """Get OAuth client ID and secret from JSON file, .env file, or environment variables."""
     load_dotenv()
@@ -117,7 +184,44 @@ def get_access_token(client_id: str, client_secret: str, auth_code: str) -> str:
     response.raise_for_status()
     
     token_data = response.json()
-    return token_data["access_token"]
+    access_token = token_data["access_token"]
+    
+    # Cache the token
+    save_access_token(access_token)
+    
+    return access_token
+
+def get_cached_or_new_token() -> str:
+    """Get cached token or perform OAuth flow."""
+    # Check for cached token first
+    cached_token = get_cached_access_token()
+    if cached_token:
+        print("Using cached access token")
+        return cached_token
+    
+    # Perform OAuth flow
+    client_id, client_secret = get_oauth_credentials()
+    auth_url = get_authorization_url(client_id)
+    
+    print(f"\n1. Visit this URL: {auth_url}\n")
+    print("2. Authorize the application")
+    print("3. You'll be redirected to localhost:8080 - THIS WILL SHOW AN ERROR (normal!)")
+    print("4. In the browser address bar, copy the 'code' parameter")
+    print("   Example URL: http://localhost:8080/?code=4/XXXXX&scope=...")
+    print("   Copy only: 4/XXXXX\n")
+    auth_code = input("Paste authorization code here: ").strip()
+    
+    if not auth_code:
+        print("No authorization code provided")
+        sys.exit(1)
+    
+    try:
+        access_token = get_access_token(client_id, client_secret, auth_code)
+        print("Authorization successful!")
+        return access_token
+    except requests.exceptions.HTTPError as e:
+        print(f"OAuth error: {e}")
+        sys.exit(1)
 
 
 def get_subscriptions(access_token: str, max_results: int = 50, use_cache: bool = True) -> List[Dict]:

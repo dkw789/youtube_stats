@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 from requests import HTTPError, Response
+from youtube_auth import get_youtube_token
 
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
@@ -341,7 +342,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def get_api_key(cli_key: Optional[str]) -> str:
 	key = cli_key or os.getenv("YOUTUBE_API_KEY")
 	if not key:
-		raise SystemExit("Missing API key. Provide --api-key or set YOUTUBE_API_KEY.")
+		# Try OAuth as fallback
+		try:
+			return get_youtube_token()
+		except:
+			raise SystemExit("Missing API key. Provide --api-key, set YOUTUBE_API_KEY, or use OAuth.")
 	return key
 
 
