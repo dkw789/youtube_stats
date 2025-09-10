@@ -192,3 +192,95 @@ python yt_subscription_podcasts.py --rss-only --no-auth \
 - **Batch processing**: Efficient API usage patterns
 - **Error recovery**: Graceful handling of API limits
 - **Multi-format output**: JSON, CSV, Markdown support
+
+## YouTube API integration walkthrough
+
+This section explains how the scripts integrate with YouTube (OAuth, API calls, RSS fallback), the user flows, and which YouTube API services are called at each step.
+
+### High-level data flow
+1. Authenticate (OAuth) or run in RSS-only / manual mode.
+2. Obtain list of subscribed channels (subscriptions.list) or use provided channel IDs.
+3. For each channel: discover recent videos using search.list (preferred), channels.list + playlistItems.list (uploads playlist fallback), or RSS feed (zero-quota fallback).
+4. Gather video statistics using videos.list (snippet + statistics) to compute views/likes/comments.
+5. Cache responses to minimize quota usage and assemble sorted results for display/export.
+
+### User flows
+- Authenticated (recommended)
+  - User provides OAuth credentials (client_secret_*.json or env).
+  - App opens browser to Google OAuth consent URL (scope: https://www.googleapis.com/auth/youtube.readonly).
+  - Local server / manual code copy captures authorization code and exchanges it at https://oauth2.googleapis.com/token for an access token.
+  - The access token is cached (short TTL) and used in Authorization: Bearer <token> headers.
+  - Subscriptions are fetched with subscriptions.list (mine=true) to enumerate channels.
+
+- RSS-only / No-auth
+  - No OAuth required. The user passes channel IDs via --channel-ids.
+  - The script fetches https://www.youtube.com/feeds/videos.xml?channel_id=<id> and parses entries with feedparser.
+  - This flow uses zero YouTube Data API quota but lacks view/like/comment stats.
+
+- Manual channel IDs
+  - Useful when subscriptions are not accessible or when running RSS-only mode.
+  - Bypasses subscriptions.list and proceeds directly to search/playlist/RSS for the provided channels.
+
+### Specific API services called
+- OAuth endpoints
+  - Authorization URL: https://accounts.google.com/o/oauth2/v2/auth (user consent, response_type=code)
+  - Token exchange: https://oauth2.googleapis.com/token (exchange code → access_token)
+
+- YouTube Data API v3 endpoints
+  - subscriptions.list
+    - Purpose: list the authenticated user's subscriptions (channels)
+    - Parameters: part=snippet, mine=true, maxResults=...
+    - Used in: authenticated flow to build the channel list.
+
+  - search.list
+    - Purpose: find videos on a channel, ordered by date (quick way to discover recent uploads)
+    - Parameters: part=snippet, channelId=<id>, type=video, order=date, publishedAfter=..., maxResults=...
+    - Cost: relatively high (e.g., scripts treat it as significant quota cost)
+    - Used as the primary discovery method when using the API.
+
+  - channels.list
+    - Purpose: fetch channel contentDetails to find the uploads playlist ID
+    - Parameters: part=contentDetails, id=<channelId>
+    - Used when falling back to the uploads playlist method.
+
+  - playlistItems.list
+    - Purpose: read the uploads playlist to get recent uploads
+    - Parameters: part=snippet, playlistId=<uploads_playlist_id>, maxResults=...
+    - Used as a lower-quota fallback when search.list is limited or fails.
+
+  - videos.list
+    - Purpose: fetch detailed snippet + statistics for videos
+    - Parameters: part=snippet,statistics (and optional contentDetails), id=<comma-separated video IDs>
+    - Cost: typically 1 unit per video for statistics; used to obtain view/like/comment counts for ranking.
+
+- RSS feeds (non-API)
+  - URL: https://www.youtube.com/feeds/videos.xml?channel_id=<id>
+  - Parsed by feedparser to get titles, publish dates, and video IDs.
+  - Zero YouTube Data API quota cost but limited metadata (no view/like counts).
+
+### Caching and quota strategies
+- Local caching: responses are cached in .cache (or subscriptions_output/.cache) with TTLs to avoid repeated API calls.
+- Batch requests: video statistics are requested in batches of up to 50 IDs per videos.list call to respect API limits.
+- Quota accounting: scripts estimate and optionally limit requests (e.g., avoid exceeding daily quota).
+- Fallback behavior:
+  - On HTTP 403/429 or quota issues, scripts fall back to RSS or uploads playlist methods.
+  - Consecutive 403s can trigger auto-switch to RSS-only mode for remaining channels.
+
+### Error handling and edge cases
+- Missing OAuth scope (must include youtube.readonly) or disabled API → subscriptions access denied (403).
+- API quota exceeded → scripts either use cached data, stop, or switch to RSS fallback.
+- RSS parsing errors → script logs and continues with other channels.
+- Time-window filtering: publishedAfter parameter or RSS entry date filtering to limit to last week/month.
+
+### Data produced and outputs
+- For API-enabled runs: each item includes title, channel, publishedAt, views, likes, comments, and URL.
+- For RSS-only runs: items include title, channel, publishedAt, and URL (statistics set to 0).
+- Outputs: console table, JSON, CSV, or Markdown depending on CLI options.
+
+### Quick mapping (where to look in code)
+- Authentication & token caching: youtube_auth.py and youtube_subscriptions.py (get_oauth_credentials, get_access_token, cached token helpers)
+- Subscriptions: subscriptions.list usage in get_subscriptions()
+- Channel discovery: search.list in search_channel_videos(), channels.list + playlistItems.list in get_channel_uploads()
+- RSS parsing: get_rss_videos() / get_rss_podcasts() using feedparser
+- Video statistics: videos.list in get_video_details() / get_video_stats()
+- Caching: save_cache() / load_cache() functions present across scripts
