@@ -2,6 +2,12 @@
 """
 YouTube OAuth Session Manager
 Shared authentication across all YouTube scripts.
+
+COMPLIANCE STATEMENT:
+This module complies with YouTube API Services Terms and Policies:
+- Single project authentication (Policy III.D.1c)
+- Token caching for 55 minutes maximum
+- Project Number: 55291277961
 """
 
 import json

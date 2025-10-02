@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
 Find most popular podcast episodes from your YouTube subscriptions.
+
+COMPLIANCE STATEMENT:
+This script complies with YouTube API Services Terms and Policies:
+- Displays only YouTube-provided metrics (views, likes, comments)
+- No independently calculated or derived metrics (Policy III.E.4h)
+- Data cached for maximum 24 hours (Policy III.E.4.a-g)
+- Single project number: 55291277961 (Policy III.D.1c)
 """
 
 import argparse

@@ -1,5 +1,12 @@
 # YouTube Data Collection Scripts
 
+**YOUTUBE API COMPLIANCE STATEMENT:**  
+This project complies with YouTube API Services Terms and Policies (Project #55291277961):
+- ✅ Displays only YouTube-provided metrics (views, likes, comments)
+- ✅ No independently calculated or derived metrics (Policy III.E.4h)
+- ✅ Data cached for maximum 24 hours (Policy III.E.4.a-g)
+- ✅ Single project number for all scripts (Policy III.D.1c)
+
 A collection of Python scripts for finding and analyzing YouTube content using the YouTube Data API v3 and RSS feeds.
 
 ## Scripts Overview
@@ -186,12 +193,39 @@ python yt_subscription_podcasts.py --rss-only --no-auth \
 
 ## Advanced Features
 
-- **Smart caching**: 24-hour cache with automatic expiration
+- **Smart caching**: 24-hour cache with automatic expiration (Policy III.E.4.a-g compliant)
 - **Quota tracking**: Cross-session quota usage monitoring
 - **Progress saving**: Resume interrupted collections
 - **Batch processing**: Efficient API usage patterns
 - **Error recovery**: Graceful handling of API limits
 - **Multi-format output**: JSON, CSV, Markdown support
+- **YouTube metrics only**: No derived or calculated metrics (Policy III.E.4h compliant)
+
+## Data Usage & Compliance
+
+**What We Collect:**
+- Views (from YouTube API `statistics.viewCount`)
+- Likes (from YouTube API `statistics.likeCount`)
+- Comments (from YouTube API `statistics.commentCount`)
+- Published date (from YouTube API `snippet.publishedAt`)
+- Title, channel, URL (from YouTube API `snippet`)
+
+**What We DON'T Calculate:**
+- ❌ Engagement rates or ratios
+- ❌ Performance scores or rankings beyond YouTube metrics
+- ❌ Any derived or independently calculated metrics
+
+**Data Retention:**
+- Maximum 24 hours (cache only)
+- Automatic expiration and deletion
+- No long-term storage
+- Research use only
+
+**User Guidelines:**
+- Use only for academic research
+- Export raw YouTube data for external analysis
+- Perform statistical analysis in separate tools (R, Python pandas, etc.)
+- Do not modify or derive metrics within the API client
 
 ## YouTube API integration walkthrough
 
