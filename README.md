@@ -44,6 +44,14 @@ pip install -r requirements.txt
 pip install feedparser
 ```
 
+All scripts now share common helpers in `utils/`:
+
+- `utils/cache.py`: file-backed cache with TTL-aware entries (`CacheManager`).
+- `utils/quota.py`: `QuotaTracker` for consistent quota accounting across scripts.
+- `utils/logging.py`: `setup_logging()` and `get_logger()` for structured logging.
+
+By default, caches live under `~/.youtube_scripts_cache/` (OAuth tokens) and per-script cache directories (`.cache/most_popular`, `subscriptions_output/.cache`, etc.). Use `--clear-cache` to remove per-script caches.
+
 ### Authentication Setup
 
 **Option 1: API Key (Simple)**
@@ -136,8 +144,9 @@ All scripts support multiple output formats:
 - `--period week|month`: Time window for recent content
 - `--top N`: Number of results to return
 - `--sort-by views|likes|comments`: Sort criteria
-- `--no-cache`: Force fresh API calls
-- `--clear-cache`: Clear all cached data
+- `--no-cache`: Force fresh API calls (bypass file cache)
+- `--clear-cache`: Clear cached API responses for that script
+- `--log-level`: Override log verbosity (default `INFO`)
 
 ## RSS-Only Mode (No Quota)
 

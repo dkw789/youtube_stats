@@ -50,6 +50,10 @@ top_*.csv
 top_*.json
 results.*
 
+# Allow primary documentation
+!README.md
+!SCRIPTS_DOCUMENTATION.md
+
 # IDE and editor files
 .vscode/
 .idea/

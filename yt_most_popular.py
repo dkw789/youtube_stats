@@ -12,30 +12,35 @@ This script complies with YouTube API Services Terms and Policies:
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from requests import HTTPError, Response
+from requests import Response
+
+from utils import CacheManager, CacheTTL, QuotaLimitError, QuotaTracker, get_logger, setup_logging
 from youtube_auth import get_youtube_token
 
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
 # YouTube API quota costs
-SEARCH_QUOTA_COST = 100  # per search request
-VIDEO_DETAILS_QUOTA_COST = 1  # per video details request
-DAILY_QUOTA_LIMIT = 10000  # free tier limit
-SAFETY_BUFFER = 500  # reserve some quota for safety
+SEARCH_QUOTA_COST = 100
+VIDEO_DETAILS_QUOTA_COST = 1
+DAILY_QUOTA_LIMIT = 10000
+SAFETY_BUFFER = 500
+DEFAULT_TIMEOUT_SECONDS = 30
 
 # Cache settings
-CACHE_DIR = ".cache"
-CACHE_EXPIRY_HOURS = 24  # Cache expires after 24 hours
+CACHE_DIR = os.path.join(".cache", "most_popular")
+
+
+logger = get_logger(__name__)
+cache_manager = CacheManager(CACHE_DIR)
 
 
 def iso8601(dt: datetime) -> str:
@@ -59,189 +64,199 @@ def batched(iterable: List[str], size: int) -> List[List[str]]:
     return [iterable[i : i + size] for i in range(0, len(iterable), size)]
 
 
-def get_cache_key(params: Dict) -> str:
-    """Generate a cache key from API parameters."""
-    # Remove timestamp-sensitive fields and create hash
-    cache_params = {k: v for k, v in params.items() if k not in ['key', 'pageToken']}
-    param_str = json.dumps(cache_params, sort_keys=True)
-    return hashlib.md5(param_str.encode()).hexdigest()
+def _cache_key(*parts: str) -> str:
+    return "::".join(parts)
 
 
-def get_cache_path(cache_key: str, endpoint: str) -> str:
-    """Get the file path for a cache entry."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{endpoint}_{cache_key}.json")
-
-
-def is_cache_valid(cache_path: str) -> bool:
-    """Check if cache file exists and is not expired."""
-    if not os.path.exists(cache_path):
-        return False
-
-    file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_path))
-    return file_age.total_seconds() < (CACHE_EXPIRY_HOURS * 3600)
-
-
-def load_from_cache(cache_path: str) -> Optional[Dict]:
-    """Load data from cache file."""
-    try:
-        with open(cache_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+def _cache_load(namespace: str, key_parts: List[str], ttl: CacheTTL, use_cache: bool, quota: Optional[QuotaTracker]) -> Optional[Any]:
+    if not use_cache:
         return None
+    payload = cache_manager.load(namespace, _cache_key(*key_parts), ttl)
+    if payload is not None and quota is not None:
+        quota.record_saved()
+    return payload
 
 
-def save_to_cache(cache_path: str, data: Dict) -> None:
-    """Save data to cache file."""
+def _cache_save(namespace: str, key_parts: List[str], payload: Any) -> None:
+    cache_manager.save(namespace, _cache_key(*key_parts), payload)
+
+
+def _build_headers(access_token: Optional[str]) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    return headers
+
+
+def _request_json(
+    namespace: str,
+    key_parts: List[str],
+    url: str,
+    params: Dict[str, Any],
+    headers: Dict[str, str],
+    ttl: CacheTTL,
+    use_cache: bool,
+    quota: Optional[QuotaTracker],
+    quota_cost: int,
+    quota_action: str,
+) -> Dict[str, Any]:
+    cached = _cache_load(namespace, key_parts, ttl, use_cache, quota)
+    if cached is not None:
+        return cached
+
+    if quota is not None and quota_cost:
+        quota.ensure_within_limit(quota_cost)
+
     try:
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Warning: Failed to save cache: {e}")
-
-
-def cached_api_request(url: str, params: Dict, endpoint: str, quota_tracker: Optional[Dict[str, int]] = None, no_cache: bool = False) -> Dict:
-    """Make API request with caching."""
-    if no_cache:
-        # Skip caching, make direct API request
-        resp = requests.get(url, params=params, timeout=30)
-        try:
-            resp.raise_for_status()
-        except HTTPError as e:
-            message, reason = parse_api_error(resp)
-            raise SystemExit(
-                f"YouTube API error during {endpoint}: {message} (reason={reason}). "
-                "Check API key validity, API enablement (YouTube Data API v3), and key restrictions."
-            ) from e
-        return resp.json()
-
-    cache_key = get_cache_key(params)
-    cache_path = get_cache_path(cache_key, endpoint)
-
-    # Try to load from cache first
-    if is_cache_valid(cache_path):
-        cached_data = load_from_cache(cache_path)
-        if cached_data:
-            print(f"Using cached data for {endpoint} (saved quota units)")
-            if quota_tracker:
-                quota_tracker["saved"] = quota_tracker.get("saved", 0) + 1
-            return cached_data
-
-    # Make API request
-    resp = requests.get(url, params=params, timeout=30)
-    try:
-        resp.raise_for_status()
-    except HTTPError as e:
-        message, reason = parse_api_error(resp)
+        response = requests.get(url, params=params, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        message, reason = parse_api_error(exc.response)
         raise SystemExit(
-            f"YouTube API error during {endpoint}: {message} (reason={reason}). "
-            "Check API key validity, API enablement (YouTube Data API v3), and key restrictions."
-        ) from e
+            f"YouTube API error during {quota_action}: {message} (reason={reason}). "
+            "Check API credentials, enablement (YouTube Data API v3), and quota settings."
+        ) from exc
 
-    data = resp.json()
+    data = response.json()
 
-    # Save to cache
-    save_to_cache(cache_path, data)
+    if quota is not None and quota_cost:
+        quota.spend(quota_action, quota_cost)
+
+    if use_cache:
+        _cache_save(namespace, key_parts, data)
 
     return data
 
 
 def search_videos(
-    api_key: str,
+    api_key: Optional[str],
+    access_token: Optional[str],
     region_code: str,
     published_after: datetime,
     max_results: int,
-    topic_id: Optional[str] = None,
-    query: Optional[str] = None,
-    quota_tracker: Optional[Dict[str, int]] = None,
-    no_cache: bool = False,
+    topic_id: Optional[str],
+    query: Optional[str],
+    quota: QuotaTracker,
+    use_cache: bool,
 ) -> List[Dict]:
-    """Search for videos ordered by viewCount, published after a time.
+    """Search for recently published videos and return API search items."""
 
-    Returns a list of search items with id.videoId.
-    """
-    url = f"{YOUTUBE_API_BASE}/search"
-    params = {
-        "key": api_key,
+    if max_results <= 0:
+        return []
+
+    base_params: Dict[str, Any] = {
         "type": "video",
-        "order": "date",  # Use 'date' instead of 'viewCount' for recent videos
+        "order": "date",
         "publishedAfter": iso8601(published_after),
-        "maxResults": 50,  # API max per page
+        "maxResults": 50,
         "regionCode": region_code,
-        "q": query or "a|e|i|o|u",  # Broad search - most videos contain vowels
+        "q": query or "a|e|i|o|u",
     }
+    if api_key:
+        base_params["key"] = api_key
     if topic_id:
-        params["topicId"] = topic_id
+        base_params["topicId"] = topic_id
 
-    items: List[Dict] = []
+    headers = _build_headers(access_token)
+    url = f"{YOUTUBE_API_BASE}/search"
+
+    items: List[Dict[str, Any]] = []
     next_page_token: Optional[str] = None
-    while True:
+
+    while len(items) < max_results:
+        params = dict(base_params)
         if next_page_token:
             params["pageToken"] = next_page_token
 
-        # Check quota before making request
-        if quota_tracker:
-            estimated_cost = SEARCH_QUOTA_COST
-            if quota_tracker.get("used", 0) + estimated_cost > DAILY_QUOTA_LIMIT - SAFETY_BUFFER:
-                print(f"Quota limit reached. Used: {quota_tracker.get('used', 0)}, "
-                      f"would need: {estimated_cost}, limit: {DAILY_QUOTA_LIMIT - SAFETY_BUFFER}")
-                break
+        key_parts = [json.dumps({k: v for k, v in params.items() if k != "key"}, sort_keys=True)]
 
-        # Use cached API request
-        data = cached_api_request(url, params, "search", quota_tracker, no_cache)
+        try:
+            data = _request_json(
+                namespace="search",
+                key_parts=key_parts,
+                url=url,
+                params=params,
+                headers=headers,
+                ttl=CacheTTL.DAY,
+                use_cache=use_cache,
+                quota=quota,
+                quota_cost=SEARCH_QUOTA_COST,
+                quota_action="search.list",
+            )
+        except QuotaLimitError as exc:
+            logger.warning("Quota limit reached during search.list: %s", exc)
+            break
 
-        # Track quota usage (only if not cached)
-        if quota_tracker and not quota_tracker.get("saved", 0):
-            quota_tracker["used"] = quota_tracker.get("used", 0) + SEARCH_QUOTA_COST
-        items.extend(data.get("items", []))
-
-        # Debug: Print search results info
-        print(f"Search request returned {len(data.get('items', []))} items, total so far: {len(items)}")
-        if not data.get("items"):
-            print(f"Debug: Search response keys: {list(data.keys())}")
-            if "error" in data:
-                print(f"Debug: API error in response: {data['error']}")
+        page_items = data.get("items", [])
+        items.extend(page_items)
+        logger.debug("search.list returned %d items (total=%d)", len(page_items), len(items))
 
         if len(items) >= max_results:
-            return items[:max_results]
+            break
+
         next_page_token = data.get("nextPageToken")
         if not next_page_token:
             break
-    return items
+
+    return items[:max_results]
 
 
-def fetch_video_stats(api_key: str, video_ids: List[str], quota_tracker: Optional[Dict[str, int]] = None, no_cache: bool = False) -> List[Dict]:
+def fetch_video_stats(
+    api_key: Optional[str],
+    access_token: Optional[str],
+    video_ids: List[str],
+    quota: QuotaTracker,
+    use_cache: bool,
+) -> List[Dict]:
     """Fetch snippet and statistics for given video IDs."""
-    url = f"{YOUTUBE_API_BASE}/videos"
-    results: List[Dict] = []
-    for chunk in batched(video_ids, 50):
-        # Check quota before making request
-        if quota_tracker:
-            estimated_cost = VIDEO_DETAILS_QUOTA_COST * len(chunk)
-            if quota_tracker.get("used", 0) + estimated_cost > DAILY_QUOTA_LIMIT - SAFETY_BUFFER:
-                print(f"Quota limit reached. Used: {quota_tracker.get('used', 0)}, "
-                      f"would need: {estimated_cost}, limit: {DAILY_QUOTA_LIMIT - SAFETY_BUFFER}")
-                break
 
-        params = {
-            "key": api_key,
+    if not video_ids:
+        return []
+
+    headers = _build_headers(access_token)
+    url = f"{YOUTUBE_API_BASE}/videos"
+    results: List[Dict[str, Any]] = []
+
+    for chunk in batched(video_ids, 50):
+        params: Dict[str, Any] = {
             "id": ",".join(chunk),
             "part": "snippet,statistics,contentDetails",
             "maxResults": 50,
         }
+        if api_key:
+            params["key"] = api_key
 
-        # Use cached API request
-        payload = cached_api_request(url, params, "videos", quota_tracker, no_cache)
+        key_parts = ["::".join(sorted(chunk))]
+        cost = VIDEO_DETAILS_QUOTA_COST * len(chunk)
 
-        # Track quota usage (only if not cached)
-        if quota_tracker and not quota_tracker.get("saved", 0):
-            quota_tracker["used"] = quota_tracker.get("used", 0) + VIDEO_DETAILS_QUOTA_COST * len(chunk)
-        results.extend(payload.get("items", []))
+        try:
+            data = _request_json(
+                namespace="videos",
+                key_parts=key_parts,
+                url=url,
+                params=params,
+                headers=headers,
+                ttl=CacheTTL.DAY,
+                use_cache=use_cache,
+                quota=quota,
+                quota_cost=cost,
+                quota_action="videos.list",
+            )
+        except QuotaLimitError as exc:
+            logger.warning("Quota limit reached during videos.list: %s", exc)
+            break
+
+        chunk_items = data.get("items", [])
+        results.extend(chunk_items)
+        logger.debug("videos.list returned %d items (total=%d)", len(chunk_items), len(results))
+
     return results
 
 
-def parse_api_error(resp: Response) -> Tuple[str, str]:
+def parse_api_error(resp: Optional[Response]) -> Tuple[str, str]:
     """Extract message and reason from a YouTube API error response."""
+    if resp is None:
+        return ("Unknown response", "unknown")
     try:
         payload = resp.json()
         message = payload.get("error", {}).get("message", str(resp.text))
@@ -249,7 +264,7 @@ def parse_api_error(resp: Response) -> Tuple[str, str]:
         reason = errors[0].get("reason") if errors else payload.get("error", {}).get("status", "unknown")
         return message, reason or "unknown"
     except Exception:
-        return f"HTTP {resp.status_code} {resp.reason}", "unknown"
+        return (f"HTTP {resp.status_code} {resp.reason}", "unknown")
 
 
 def human_int(n: Optional[str]) -> int:
@@ -350,107 +365,110 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--md", default=os.getenv("YT_MD_PATH"), help="Markdown path (env: YT_MD_PATH)")
     parser.add_argument("--no-cache", action="store_true", help="Disable caching (force fresh API calls)")
     parser.add_argument("--clear-cache", action="store_true", help="Clear all cached data before running")
+    parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (env: LOG_LEVEL)")
     return parser.parse_args(argv)
 
 
-def get_api_key(cli_key: Optional[str]) -> str:
-    key = cli_key or os.getenv("YOUTUBE_API_KEY")
-    if not key:
-        # Try OAuth as fallback
-        try:
-            return get_youtube_token()
-        except:
-            raise SystemExit("Missing API key. Provide --api-key, set YOUTUBE_API_KEY, or use OAuth.")
-    return key
+def resolve_credentials(api_key_arg: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    api_key = api_key_arg or os.getenv("YOUTUBE_API_KEY")
+    if api_key:
+        return api_key, None
+    access_token = get_youtube_token()
+    return None, access_token
 
 
 def clear_cache() -> None:
     """Clear all cached data."""
-    if os.path.exists(CACHE_DIR):
-        import shutil
-        shutil.rmtree(CACHE_DIR)
-        print("Cache cleared.")
+    cache_manager.clear_all()
+    logger.info("Cache cleared")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    # Load variables from a local .env file if present
     load_dotenv()
     args = parse_args(argv)
-    api_key = get_api_key(args.api_key)
+    setup_logging(args.log_level.upper())
 
-    # Clear cache if requested
+    use_cache = not args.no_cache
+
     if args.clear_cache:
         clear_cache()
 
-    # Initialize quota tracker
-    quota_tracker = {"used": 0, "saved": 0}
+    api_key, access_token = resolve_credentials(args.api_key)
 
-    # Calculate estimated quota usage
-    estimated_search_requests = (max(1, args.max_results) + 49) // 50  # round up
+    quota = QuotaTracker(daily_limit=DAILY_QUOTA_LIMIT, safety_buffer=SAFETY_BUFFER)
+
+    estimated_search_requests = max(1, (max(1, args.max_results) + 49) // 50)
     estimated_search_cost = estimated_search_requests * SEARCH_QUOTA_COST
-    estimated_video_cost = min(args.max_results, 200) * VIDEO_DETAILS_QUOTA_COST  # cap at reasonable limit
+    estimated_video_cost = min(args.max_results, 200) * VIDEO_DETAILS_QUOTA_COST
     total_estimated = estimated_search_cost + estimated_video_cost
 
-    print(f"Estimated quota usage: {total_estimated} units (search: {estimated_search_cost}, videos: {estimated_video_cost})")
-    print(f"Daily limit: {DAILY_QUOTA_LIMIT} units (safety buffer: {SAFETY_BUFFER})")
+    logger.info(
+        "Estimated quota usage: %d (search=%d, videos=%d)",
+        total_estimated,
+        estimated_search_cost,
+        estimated_video_cost,
+    )
 
-    if total_estimated > DAILY_QUOTA_LIMIT - SAFETY_BUFFER:
-        print(f"WARNING: Estimated usage ({total_estimated}) exceeds safe limit ({DAILY_QUOTA_LIMIT - SAFETY_BUFFER})")
-        print("Consider reducing --max-results or --top to stay within free tier.")
+    if total_estimated > quota._max_allowed():  # type: ignore[attr-defined]
+        logger.warning(
+            "Estimated usage %d exceeds safe limit %d",
+            total_estimated,
+            quota._max_allowed(),
+        )
         response = input("Continue anyway? (y/N): ").strip().lower()
-        if response != 'y':
-            print("Aborted.")
+        if response != "y":
+            logger.info("Aborted by user due to quota concerns")
             return 1
 
     if args.published_after:
         try:
             published_after_dt = datetime.fromisoformat(args.published_after.replace("Z", "+00:00")).astimezone(timezone.utc)
-        except Exception:
-            raise SystemExit("--published-after must be ISO8601, e.g. 2025-01-01T00:00:00Z")
+        except Exception as exc:
+            raise SystemExit("--published-after must be ISO8601, e.g. 2025-01-01T00:00:00Z") from exc
     else:
         published_after_dt = compute_published_after(args.period)
 
-    # Set up search parameters
     search_query = args.query
     if args.podcast:
         search_query = "podcast" if not search_query else f"{search_query} podcast"
 
-    print(f"Searching for videos published after: {iso8601(published_after_dt)}")
-    print(f"Region: {args.region}, Max results: {args.max_results}")
-    if search_query:
-        print(f"Search query: {search_query}")
+    logger.info(
+        "Searching after %s (region=%s, max_results=%d, query=%s)",
+        iso8601(published_after_dt),
+        args.region,
+        args.max_results,
+        search_query or "(default)",
+    )
 
     search_items = search_videos(
         api_key=api_key,
+        access_token=access_token,
         region_code=args.region,
         published_after=published_after_dt,
         max_results=max(1, args.max_results),
         topic_id=args.topic_id,
         query=search_query,
-        quota_tracker=quota_tracker,
-        no_cache=args.no_cache,
+        quota=quota,
+        use_cache=use_cache,
     )
 
-    print(f"Total search items found: {len(search_items)}")
+    logger.info("Search returned %d items", len(search_items))
     video_ids = [it.get("id", {}).get("videoId") for it in search_items if it.get("id", {}).get("videoId")]
-    # Remove duplicates from video_ids
-    unique_video_ids = list(dict.fromkeys(video_ids))  # Preserves order while removing duplicates
-    print(f"Valid video IDs extracted: {len(video_ids)} (unique: {len(unique_video_ids)})")
+    unique_video_ids = list(dict.fromkeys(filter(None, video_ids)))
+    logger.info("Extracted %d video IDs (%d unique)", len(video_ids), len(unique_video_ids))
 
     if not unique_video_ids:
-        print("No videos found. This could be due to:")
-        print("1. YouTube Data API v3 not enabled")
-        print("2. API key restrictions")
-        print("3. No videos in the specified time window/region")
-        print("4. API quota exceeded")
+        print("No videos found.")
+        print("Possible causes: API not enabled, key restrictions, limited results, or quota exhaustion.")
         return 0
 
-    video_items = fetch_video_stats(api_key, unique_video_ids, quota_tracker, args.no_cache)
+    video_items = fetch_video_stats(api_key, access_token, unique_video_ids, quota, use_cache)
     rows = assemble_results(video_items, args.sort_by)
 
-    print(f"\nFinal quota usage: {quota_tracker['used']} units")
-    if quota_tracker.get('saved', 0) > 0:
-        print(f"Quota saved by caching: {quota_tracker['saved']} units")
+    print(f"\nFinal quota usage: {quota.used} units")
+    if quota.saved > 0:
+        print(f"Quota saved by caching: {quota.saved} requests")
+
     print_table(rows, args.top, args.sort_by)
 
     if args.csv:
@@ -463,6 +481,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_markdown(rows, args.md, args.top, args.sort_by)
         print(f"Wrote Markdown: {args.md}")
 
+    logger.info(
+        "Quota usage summary: used=%d saved=%d remaining=%d",
+        quota.used,
+        quota.saved,
+        quota.daily_limit - quota.used,
+    )
     return 0
 
 
